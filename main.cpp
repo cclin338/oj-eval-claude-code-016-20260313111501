@@ -3,14 +3,13 @@
 #include <cstring>
 #include <vector>
 #include <algorithm>
+#include <map>
 #include <set>
 
 using namespace std;
 
 const int MAX_KEY_LEN = 65;
-const int BLOCK_SIZE = 4096;
-const int MAX_CHILDREN = 50;
-const int MIN_CHILDREN = MAX_CHILDREN / 2;
+const int ORDER = 100;  // B+ tree order
 
 struct KeyValue {
     char key[MAX_KEY_LEN];
@@ -40,44 +39,57 @@ struct KeyValue {
 
 class BPlusTree {
 private:
-    string dataFile;
-    string indexFile;
-
     struct Node {
         bool isLeaf;
         int numKeys;
-        KeyValue keys[MAX_CHILDREN];
-        int children[MAX_CHILDREN + 1];
-        int next;  // For leaf nodes, link to next leaf
+        KeyValue keys[ORDER];
+        int children[ORDER + 1];
+        int next;
 
         Node() {
             isLeaf = true;
             numKeys = 0;
             next = -1;
-            memset(children, -1, sizeof(children));
+            for (int i = 0; i <= ORDER; i++) {
+                children[i] = -1;
+            }
         }
     };
 
+    string indexFile;
+    fstream indexStream;
     int rootPos;
     int nodeCount;
-    fstream dataStream;
-    fstream indexStream;
+    map<int, Node> cache;  // Cache nodes in memory
+    bool dirty;
+
+    void openStream() {
+        if (!indexStream.is_open()) {
+            indexStream.open(indexFile, ios::in | ios::out | ios::binary);
+        }
+    }
+
+    void closeStream() {
+        if (indexStream.is_open()) {
+            indexStream.close();
+        }
+    }
 
     void initFiles() {
         ifstream test(indexFile);
         if (!test.good()) {
-            // Create new files
-            ofstream d(dataFile, ios::binary);
-            ofstream i(indexFile, ios::binary);
-            d.close();
-            i.close();
+            test.close();
+            // Create new file
+            ofstream create(indexFile, ios::binary);
+            create.close();
 
             rootPos = 0;
             nodeCount = 1;
             Node root;
             root.isLeaf = true;
-            writeNode(rootPos, root);
+            cache[rootPos] = root;
             saveMetadata();
+            saveAllNodes();
         } else {
             test.close();
             loadMetadata();
@@ -85,35 +97,50 @@ private:
     }
 
     void loadMetadata() {
-        indexStream.open(indexFile, ios::in | ios::out | ios::binary);
+        openStream();
         indexStream.seekg(0);
         indexStream.read((char*)&rootPos, sizeof(rootPos));
         indexStream.read((char*)&nodeCount, sizeof(nodeCount));
-        indexStream.close();
+        closeStream();
     }
 
     void saveMetadata() {
-        indexStream.open(indexFile, ios::in | ios::out | ios::binary);
+        openStream();
         indexStream.seekp(0);
         indexStream.write((char*)&rootPos, sizeof(rootPos));
         indexStream.write((char*)&nodeCount, sizeof(nodeCount));
-        indexStream.close();
+        closeStream();
     }
 
-    Node readNode(int pos) {
+    Node& getNode(int pos) {
+        if (cache.find(pos) != cache.end()) {
+            return cache[pos];
+        }
+
         Node node;
-        indexStream.open(indexFile, ios::in | ios::out | ios::binary);
+        openStream();
         indexStream.seekg(sizeof(int) * 2 + pos * sizeof(Node));
         indexStream.read((char*)&node, sizeof(Node));
-        indexStream.close();
-        return node;
+        closeStream();
+
+        cache[pos] = node;
+        return cache[pos];
     }
 
-    void writeNode(int pos, const Node& node) {
-        indexStream.open(indexFile, ios::in | ios::out | ios::binary);
+    void saveNode(int pos) {
+        if (cache.find(pos) == cache.end()) return;
+
+        openStream();
         indexStream.seekp(sizeof(int) * 2 + pos * sizeof(Node));
-        indexStream.write((char*)&node, sizeof(Node));
-        indexStream.close();
+        indexStream.write((char*)&cache[pos], sizeof(Node));
+        closeStream();
+    }
+
+    void saveAllNodes() {
+        for (auto& p : cache) {
+            saveNode(p.first);
+        }
+        saveMetadata();
     }
 
     int allocateNode() {
@@ -121,10 +148,9 @@ private:
     }
 
     void insertNonFull(int nodePos, const KeyValue& kv) {
-        Node node = readNode(nodePos);
+        Node& node = getNode(nodePos);
 
         if (node.isLeaf) {
-            // Find insert position
             int i = node.numKeys - 1;
             while (i >= 0 && kv < node.keys[i]) {
                 node.keys[i + 1] = node.keys[i];
@@ -132,20 +158,24 @@ private:
             }
             node.keys[i + 1] = kv;
             node.numKeys++;
-            writeNode(nodePos, node);
+            dirty = true;
         } else {
-            // Find child to insert
             int i = node.numKeys - 1;
             while (i >= 0 && kv < node.keys[i]) {
                 i--;
             }
             i++;
 
-            Node child = readNode(node.children[i]);
-            if (child.numKeys >= MAX_CHILDREN) {
+            Node& child = getNode(node.children[i]);
+            if (child.numKeys >= ORDER) {
                 splitChild(nodePos, i);
-                node = readNode(nodePos);
-                if (node.keys[i] < kv) {
+                if (!(getNode(nodePos).keys[i] < kv) && !(kv < getNode(nodePos).keys[i])) {
+                    // Equal, go right
+                    i++;
+                } else if (kv < getNode(nodePos).keys[i]) {
+                    // Less than, stay left
+                } else {
+                    // Greater than, go right
                     i++;
                 }
             }
@@ -154,8 +184,8 @@ private:
     }
 
     void splitChild(int parentPos, int childIdx) {
-        Node parent = readNode(parentPos);
-        Node child = readNode(parent.children[childIdx]);
+        Node& parent = getNode(parentPos);
+        Node& child = getNode(parent.children[childIdx]);
 
         int newNodePos = allocateNode();
         Node newNode;
@@ -189,13 +219,12 @@ private:
         parent.keys[childIdx] = newNode.keys[0];
         parent.numKeys++;
 
-        writeNode(parentPos, parent);
-        writeNode(parent.children[childIdx], child);
-        writeNode(newNodePos, newNode);
+        cache[newNodePos] = newNode;
+        dirty = true;
     }
 
     void findInNode(int nodePos, const char* key, vector<int>& results) {
-        Node node = readNode(nodePos);
+        Node& node = getNode(nodePos);
 
         if (node.isLeaf) {
             for (int i = 0; i < node.numKeys; i++) {
@@ -203,19 +232,30 @@ private:
                     results.push_back(node.keys[i].value);
                 }
             }
+            // Check next leaf node if exists
+            if (node.next != -1) {
+                Node& next = getNode(node.next);
+                if (next.numKeys > 0 && strcmp(next.keys[0].key, key) == 0) {
+                    findInNode(node.next, key, results);
+                }
+            }
         } else {
             int i = 0;
-            while (i < node.numKeys && strcmp(key, node.keys[i].key) >= 0) {
+            while (i < node.numKeys) {
+                int cmp = strcmp(key, node.keys[i].key);
+                if (cmp < 0) {
+                    break;
+                }
                 i++;
             }
-            if (i < node.numKeys + 1 && node.children[i] != -1) {
+            if (node.children[i] != -1) {
                 findInNode(node.children[i], key, results);
             }
         }
     }
 
     bool deleteFromNode(int nodePos, const KeyValue& kv) {
-        Node node = readNode(nodePos);
+        Node& node = getNode(nodePos);
 
         if (node.isLeaf) {
             int i = 0;
@@ -228,7 +268,7 @@ private:
                     node.keys[j] = node.keys[j + 1];
                 }
                 node.numKeys--;
-                writeNode(nodePos, node);
+                dirty = true;
                 return true;
             }
             return false;
@@ -247,45 +287,54 @@ private:
 
 public:
     BPlusTree(const string& prefix) {
-        dataFile = prefix + ".dat";
         indexFile = prefix + ".idx";
+        dirty = false;
         initFiles();
     }
 
     ~BPlusTree() {
-        saveMetadata();
+        if (dirty) {
+            saveAllNodes();
+        }
     }
 
     void insert(const char* key, int value) {
         KeyValue kv(key, value);
 
-        Node root = readNode(rootPos);
-        if (root.numKeys >= MAX_CHILDREN) {
+        Node& root = getNode(rootPos);
+        if (root.numKeys >= ORDER) {
             int newRootPos = allocateNode();
             Node newRoot;
             newRoot.isLeaf = false;
             newRoot.numKeys = 0;
             newRoot.children[0] = rootPos;
-            writeNode(newRootPos, newRoot);
+            cache[newRootPos] = newRoot;
 
             splitChild(newRootPos, 0);
             rootPos = newRootPos;
-            saveMetadata();
         }
 
         insertNonFull(rootPos, kv);
+        saveAllNodes();
+        dirty = false;
+        cache.clear();  // Clear cache to save memory
     }
 
     vector<int> find(const char* key) {
         vector<int> results;
         findInNode(rootPos, key, results);
         sort(results.begin(), results.end());
+        results.erase(unique(results.begin(), results.end()), results.end());
+        cache.clear();  // Clear cache
         return results;
     }
 
     void remove(const char* key, int value) {
         KeyValue kv(key, value);
         deleteFromNode(rootPos, kv);
+        saveAllNodes();
+        dirty = false;
+        cache.clear();  // Clear cache
     }
 };
 
