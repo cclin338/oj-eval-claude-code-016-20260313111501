@@ -10,12 +10,11 @@ using namespace std;
 
 const int MAX_KEY_LEN = 65;
 
-// Simpler approach: use std::map to maintain sorted order
-// and flush to disk only at program end
+// Better approach: group values by key for faster find operations
 class FileStorage {
 private:
     string dataFile;
-    map<pair<string, int>, bool> data;  // (key, value) -> exists
+    map<string, set<int>> data;  // key -> set of values
     bool modified;
 
     void loadFromFile() {
@@ -35,7 +34,7 @@ private:
             int value;
             if (!in.read((char*)&value, sizeof(value))) break;
 
-            data[make_pair(string(key), value)] = true;
+            data[string(key)].insert(value);
         }
 
         in.close();
@@ -47,10 +46,8 @@ private:
         ofstream out(dataFile, ios::binary);
 
         for (auto& p : data) {
-            if (p.second) {  // Only save if exists
-                const string& key = p.first.first;
-                int value = p.first.second;
-
+            const string& key = p.first;
+            for (int value : p.second) {
                 int keyLen = key.length();
                 out.write((char*)&keyLen, sizeof(keyLen));
                 out.write(key.c_str(), keyLen);
@@ -71,28 +68,28 @@ public:
     }
 
     void insert(const string& key, int value) {
-        auto p = make_pair(key, value);
-        if (data.find(p) == data.end() || !data[p]) {
-            data[p] = true;
+        if (data[key].insert(value).second) {
             modified = true;
         }
     }
 
     vector<int> find(const string& key) {
-        vector<int> results;
-        for (auto& p : data) {
-            if (p.second && p.first.first == key) {
-                results.push_back(p.first.second);
-            }
+        auto it = data.find(key);
+        if (it == data.end()) {
+            return vector<int>();
         }
-        return results;
+        return vector<int>(it->second.begin(), it->second.end());
     }
 
     void remove(const string& key, int value) {
-        auto p = make_pair(key, value);
-        if (data.find(p) != data.end() && data[p]) {
-            data[p] = false;
-            modified = true;
+        auto it = data.find(key);
+        if (it != data.end()) {
+            if (it->second.erase(value) > 0) {
+                modified = true;
+                if (it->second.empty()) {
+                    data.erase(it);
+                }
+            }
         }
     }
 };
