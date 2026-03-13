@@ -1,0 +1,14 @@
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+code
+*.o
+*.out
+*.dat
+*.db
+*.index
+*.data
+*.idx
+test_*
+bptree.*
